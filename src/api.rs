@@ -1464,8 +1464,39 @@ impl Engine {
 }
 
 impl Engine {
-    /// With opponents' range scores, the placements are those the recommended team's own average range scores earn:
-    /// search at a placement, re-place from the best team's ranges, until the placement holds.
+    /// A previously completed identical request, restamped for this call.
+    fn cached_gekiso(
+        &self,
+        request: &Value,
+        source: &crate::chart::Source,
+        started: f64,
+        now: &dyn Fn() -> f64,
+        generation: u64,
+    ) -> Option<Value> {
+        let key = CompletedGekiso::key(request)?;
+        let mut response = self
+            .completed_gekiso
+            .borrow()
+            .get(&self.master, &key, source)?;
+        let current = now();
+        let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
+            request["timeLimitMs"]
+                .as_f64()
+                .map(|ms| started + ms)
+                .unwrap_or(f64::INFINITY)
+        });
+        if current >= deadline || generation != crate::cancellation_generation() {
+            return None;
+        }
+        let elapsed = current - started;
+        response["elapsedMs"] = json!(elapsed);
+        for result in response["results"].as_array_mut().into_iter().flatten() {
+            result["stats"] = json!(crate::search::Stats::default());
+            result["stats"]["elapsedMs"] = json!(elapsed);
+            result["stats"]["cacheHits"] = json!(1);
+        }
+        Some(response)
+    }
     pub fn search_gekiso(
         &self,
         request: &Value,
@@ -1475,30 +1506,8 @@ impl Engine {
     ) -> Result<Value, String> {
         let generation = crate::cancellation_generation();
         let key = CompletedGekiso::key(request);
-        let cached = key.as_ref().and_then(|key| {
-            self.completed_gekiso
-                .borrow()
-                .get(&self.master, key, source)
-        });
-        if let Some(mut response) = cached {
-            let current = now();
-            let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
-                request["timeLimitMs"]
-                    .as_f64()
-                    .map(|ms| started + ms)
-                    .unwrap_or(f64::INFINITY)
-            });
-            let expired = current >= deadline;
-            if !expired && generation == crate::cancellation_generation() {
-                let elapsed = current - started;
-                response["elapsedMs"] = json!(elapsed);
-                for result in response["results"].as_array_mut().into_iter().flatten() {
-                    result["stats"] = json!(crate::search::Stats::default());
-                    result["stats"]["elapsedMs"] = json!(elapsed);
-                    result["stats"]["cacheHits"] = json!(1);
-                }
-                return Ok(response);
-            }
+        if let Some(response) = self.cached_gekiso(request, source, started, now, generation) {
+            return Ok(response);
         }
         let response = self.search_gekiso_uncached(request, source, started, now, generation)?;
         if generation == crate::cancellation_generation() {
@@ -1510,6 +1519,101 @@ impl Engine {
         }
         Ok(response)
     }
+    fn prepare_song_chart(
+        &mut self,
+        input: &Value,
+        song: &Value,
+        key: (i32, i32),
+    ) -> Result<(), String> {
+        if let Some(entry) = master::rows(&input["charts"])
+            .into_iter()
+            .find(|r| r["song"] == *song)
+        {
+            let source = if entry["source"].is_null() {
+                crate::runtime_chart::convert(&entry["chart"])?
+            } else {
+                serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+            };
+            self.insert_chart(key.0, key.1, source)?;
+        }
+        if self.charts.contains_key(&key) {
+            self.chart_order.retain(|&old| old != key);
+            self.chart_order.push_back(key);
+        }
+        Ok(())
+    }
+    /// Searches every pending song of a deadline-free Gekiso pool concurrently.
+    /// Fills `precomputed` for the songs it settled; the caller's loop still walks
+    /// every song, so the chart cache ends up exactly as in a sequential run.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn gekiso_parallel(
+        &self,
+        input: &Value,
+        songs: &[Value],
+        started: f64,
+        now: &dyn Fn() -> f64,
+        precomputed: &mut [Option<Value>],
+    ) -> Result<(), String> {
+        let request = &input["request"];
+        let generation = crate::cancellation_generation();
+        let mut jobs = Vec::new();
+        for (index, song) in songs.iter().enumerate() {
+            if master::rows(&request["completed"])
+                .into_iter()
+                .any(|r| r["song"] == *song && r["proven"] == true)
+            {
+                continue;
+            }
+            let key = (
+                master::int(&song["songId"]),
+                master::int(&song["difficulty"]),
+            );
+            let source = match master::rows(&input["charts"])
+                .into_iter()
+                .find(|r| r["song"] == *song)
+            {
+                Some(entry) if entry["source"].is_null() => {
+                    crate::runtime_chart::convert(&entry["chart"])?
+                }
+                Some(entry) => serde_json::from_value(entry["source"].clone())
+                    .map_err(|e| e.to_string())?,
+                None => match self.sources.get(&key) {
+                    Some(source) => source.clone(),
+                    None => continue,
+                },
+            };
+            let mut single = request.clone();
+            single["goal"]["songs"] = json!([song]);
+            if self.sources.get(&key) == Some(&source)
+                && self
+                    .cached_gekiso(&single, &source, started, now, generation)
+                    .is_some()
+            {
+                continue;
+            }
+            jobs.push((index, single, source, key));
+        }
+        if jobs.len() < 2 {
+            return Ok(());
+        }
+        let master = &self.master;
+        let offset = now() - crate::clock::milliseconds();
+        let responses = crate::parallel::map(&jobs, |(_, single, source, key)| {
+            let _slots = crate::objectives::slot_table_scope();
+            crate::parallel::serial(|| {
+                let mut view = Engine::from_master(master.clone());
+                view.insert_chart(key.0, key.1, source.clone())?;
+                let clock = || crate::clock::milliseconds() + offset;
+                view.search_gekiso_uncached(single, source, started, &clock, generation)
+            })
+        })?;
+        for ((index, ..), response) in jobs.into_iter().zip(responses) {
+            precomputed[index] = Some(response);
+        }
+        Ok(())
+    }
+    /// With opponents' range scores, the placements are those the recommended team's own average range scores earn:
+    /// search at a placement, re-place from the best team's ranges, until the placement holds.
     fn search_gekiso_uncached(
         &self,
         request: &Value,
@@ -2617,6 +2721,18 @@ impl Engine {
         let mut results = Vec::new();
         let mut overall = Vec::new();
         let mut unknown = Value::Null;
+        // Songs of a Gekiso pool are independent proofs: with no deadline to
+        // apportion they run on separate threads, each single-threaded inside.
+        let mut precomputed: Vec<Option<Value>> = vec![None; songs.len()];
+        #[cfg(not(target_arch = "wasm32"))]
+        if kind == "gekiso"
+            && deadline == f64::INFINITY
+            && !self.trusted_scores
+            && !crate::progress::has_callback()
+            && crate::parallel::workers(songs.len()) >= 2
+        {
+            self.gekiso_parallel(input, &songs, started, now, &mut precomputed)?;
+        }
         for (index, song) in songs.iter().enumerate() {
             crate::progress::song(song);
             if let Some(done) = master::rows(&request["completed"])
@@ -2635,21 +2751,7 @@ impl Engine {
                 master::int(&song["songId"]),
                 master::int(&song["difficulty"]),
             );
-            if let Some(entry) = master::rows(&input["charts"])
-                .into_iter()
-                .find(|r| r["song"] == *song)
-            {
-                let source = if entry["source"].is_null() {
-                    crate::runtime_chart::convert(&entry["chart"])?
-                } else {
-                    serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
-                };
-                self.insert_chart(key.0, key.1, source)?;
-            }
-            if self.charts.contains_key(&key) {
-                self.chart_order.retain(|&old| old != key);
-                self.chart_order.push_back(key);
-            }
+            self.prepare_song_chart(input, song, key)?;
             crate::progress::chart(self.charts.get(&key), kind == "gekiso");
             let mut single = request.clone();
             single["goal"]["songs"] = json!([song]);
@@ -2670,12 +2772,15 @@ impl Engine {
                         self.search_rewards(&single, started, now)?
                     }
                 }
-                "gekiso" => self.search_gekiso(
-                    &single,
-                    self.sources.get(&key).ok_or("missing-chart")?,
-                    started,
-                    now,
-                )?,
+                "gekiso" => match precomputed[index].take() {
+                    Some(response) => response,
+                    None => self.search_gekiso(
+                        &single,
+                        self.sources.get(&key).ok_or("missing-chart")?,
+                        started,
+                        now,
+                    )?,
+                },
                 _ => unreachable!(),
             };
             normalize_response_hits(&mut response);

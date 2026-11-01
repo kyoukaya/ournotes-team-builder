@@ -44,6 +44,10 @@ pub fn with_callback<T>(callback: Option<Callback>, run: impl FnOnce() -> T) -> 
     let _restore = Restore(previous);
     run()
 }
+/// Whether this thread reports progress; such runs stay on one thread so notifications keep their order.
+pub(crate) fn has_callback() -> bool {
+    STATE.with(|s| s.borrow().callback.is_some())
+}
 pub fn keys(members: &[Member], snaps: &[Snap]) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
