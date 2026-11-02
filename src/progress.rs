@@ -45,6 +45,7 @@ pub fn with_callback<T>(callback: Option<Callback>, run: impl FnOnce() -> T) -> 
     run()
 }
 /// Whether this thread reports progress; such runs stay on one thread so notifications keep their order.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn has_callback() -> bool {
     STATE.with(|s| s.borrow().callback.is_some())
 }
