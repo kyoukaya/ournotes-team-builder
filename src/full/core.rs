@@ -182,6 +182,8 @@ pub struct Combo {
     times: Vec<i32>,
     judgements: Vec<i32>,
     combos: Vec<i32>,
+    /// The last answer of `at`: queries mostly move forward in time.
+    hint: std::cell::Cell<usize>,
 }
 impl Combo {
     pub fn add(&mut self, time: i32, judgement: i32) {
@@ -203,7 +205,21 @@ impl Combo {
         }
     }
     pub fn at(&self, time: i32) -> i32 {
-        let at = self.times.partition_point(|&t| t < time);
+        let times = &self.times;
+        // The partition point is the one index with every earlier time below
+        // `time` and none from it on, so a checked hint gives the same answer.
+        let is_point = |at: usize| {
+            (at == 0 || times[at - 1] < time) && (at == times.len() || times[at] >= time)
+        };
+        let hint = self.hint.get().min(times.len());
+        let at = if is_point(hint) {
+            hint
+        } else if hint < times.len() && is_point(hint + 1) {
+            hint + 1
+        } else {
+            times.partition_point(|&t| t < time)
+        };
+        self.hint.set(at);
         if at == 0 {
             0
         } else {
