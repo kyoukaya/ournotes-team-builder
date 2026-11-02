@@ -1,13 +1,18 @@
 // WebAssembly golden harness: `node examples/wasm_golden.mjs <engine.wasm> <input.json> <output.json> [rounds]`.
 // Mirrors examples/golden.rs (session create + run, `elapsedMs`/`stats` stripped)
 // through the exported C ABI, so its output can be diffed against the native one.
+// HANEOKA_FROZEN_CLOCK=1 pins the engine clock: Gekiso seed probes are capped at
+// 150/300 ms of wall time, so on a slow host they can stop early and reorder
+// equal-score hits. Frozen, the output is deterministic and matches native.
 import { readFileSync, writeFileSync } from "node:fs";
 
 const [wasmPath, inputPath, outputPath, roundsArg] = process.argv.slice(2);
 const rounds = Number(roundsArg ?? 1);
 const module = await WebAssembly.compile(readFileSync(wasmPath));
 const env = {
-  haneoka_now_ms: () => performance.timeOrigin + performance.now(),
+  haneoka_now_ms: process.env.HANEOKA_FROZEN_CLOCK === "1"
+    ? () => 1e12
+    : () => performance.timeOrigin + performance.now(),
   haneoka_progress: () => {},
   haneoka_search_floor: () => {},
 };
