@@ -43,6 +43,80 @@ Release (LTO) check at 75bf64d: outputs byte-identical on all four cases. Single
 
 4-core wall: gekiso_1_5 4951 ms, gekiso_5_141 2201 ms, gekiso_3_73 6639-6944 ms (pre-eb75026 6840-7334 ms; bounded by its longest song), challenge_points 305 ms.
 
+Why `frame()` keeps the float fallback above 2^24 ms although no song is that long: the lottery replay sets `params.music_length = 0` (`src/full/model/lottery.rs:125`, likewise `src/gekiso_objective.rs:2150`), so effect finish times (`execute_ms.wrapping_add(ceil_i32(duration))`, `src/full/effects.rs:108`) are not clamped to the song and can reach `frame` through `add_factor`. `frame` is also `pub`. The branch is never taken on real inputs, so it costs nothing; `ceil_i32` itself is still needed by `effects.rs:108`, `play.rs:103` and `conditions.rs:1063`.
+
+## WebAssembly
+Many users run the engine in the browser, so every change is also checked on `wasm32-unknown-unknown`.
+- Build: `rustup target add wasm32-unknown-unknown && cargo build --release --target wasm32-unknown-unknown` -> `target/wasm32-unknown-unknown/release/haneoka_team_engine.wasm`. Imports are only `env.haneoka_now_ms` and `env.haneoka_progress`.
+- Run: `HANEOKA_FROZEN_CLOCK=1 node examples/wasm_golden.mjs <engine.wasm> <input.json> <output.json> [rounds]` (same request flow and stripping as `examples/golden.rs`). Compare with a native golden after JSON normalization (the native harness writes compact JSON, this one pretty-prints), e.g. `node -e 'const f=require("fs");const r=p=>JSON.stringify(JSON.parse(f.readFileSync(p)));console.log(r(process.argv[1])===r(process.argv[2])?"same":"DIFF")' a.json b.json`.
+- Why the frozen clock: Gekiso seed probes stop after 150/300 ms of wall time (`src/api.rs:1060`, `:1092`). wasm is slower than native, so with a real clock the probes stop earlier and equal-score hits can come out in another order (gekiso_3_73 swaps two members with equal scores). This happens on unmodified `main` too. With `HANEOKA_FROZEN_CLOCK=1` the output is deterministic and equals the native golden.
+- Timing: `taskset -c 0 node --no-liftoff` (optimizing tier only, single core), runs interleaved across builds.
+
+Correctness: every commit on this branch (26acce7, 0e72393, eb75026, b9715a8, 3fa2884, e7a4af6, f298572, 75bf64d) and all three `eval/*` prototypes produce the native golden output in wasm on all four cases.
+
+Speed, quiet machine, main (69a566b) vs 75bf64d, 2 runs each:
+| case | main ms | 75bf64d ms |
+|---|---|---|
+| gekiso_5_141 | 13850/13584 | 10574/10742 (-22%) |
+| gekiso_1_5 | 29397/29363 | 21141/20894 (-28%) |
+| gekiso_3_73 | 34721/34417 | 32978/33162 (-4%) |
+| challenge_points | 2183-2367 (5 runs, mean 2267) | 2206-2327 (5 runs, mean 2273) |
+
+Per commit (2 runs each, ms; measured while builds ran on the other three cores, so absolute times are inflated and noisy, but runs were interleaved):
+| case | main | 26acce7 | 0e72393 | eb75026 | b9715a8 | 3fa2884 | e7a4af6 | f298572 | 75bf64d |
+|---|---|---|---|---|---|---|---|---|---|
+| gekiso_5_141 | 16817/16822 | 16326/16170 | 15959/15497 | 15392/15427 | 13732/13095 | 13192/12523 | 13307/13193 | 12890/13680 | 13123/13130 |
+| gekiso_1_5 | 32011/31218 | 31351/31401 | 30920/30884 | 29452/28997 | 23315/22656 | 22869/24148 | 22472/23572 | 22751/22536 | 22728/22240 |
+| gekiso_3_73 | 43732/42172 | 43811/41051 | 41431/41763 | 43711/40927 | 42225/41177 | 41305/40830 | 40863/41578 | 40753/38262 | 39999/35782 |
+
+No commit is slower in wasm. challenge_points looked noisy in that run (2.7-4.3 s); rechecked on a quiet machine, 5 runs each: main 2183-2367 ms (mean 2267), 75bf64d 2206-2327 ms (mean 2273), i.e. unchanged. Change 1 (threads) does nothing in wasm (single-threaded there; `gekiso_parallel` is native-only) and costs nothing.
+
+## Public API candidates (evaluated, not merged)
+Three changes need a public type to change. Each was prototyped on its own branch from 76dc27b and pushed to the fork (`https://github.com/kyoukaya/ournotes-team-builder`). All produce byte-identical output natively and in wasm on all four cases.
+
+| branch | commit | public change |
+|---|---|---|
+| `eval/targets-bitset` | 896ac7c | `Range::targets: FxHashSet<i32>` -> `NoteSet` (bitset over the id span; `contains`, `len`, `is_empty`, `FromIterator<i32>`) |
+| `eval/trigger-array` | ae98895 | `Effect::trigger` is moved out into `ConditionUpdater::triggers: Vec<Option<Checker>>` at construction (the field is left `None`) |
+| `eval/incremental-arena` | 7992b13 | `Incremental::notes: Vec<Vec<NoteCommand>>` -> `FrameLists<NoteCommand>` (one pool plus per-frame linked lists; clone is a few memcpys); the private `factors` uses the same type |
+
+Release (LTO) single core (`taskset -c 0`), 3 runs each interleaved with perf (52788d6; engine code identical to 76dc27b). Perf column: mean of its 9 runs; percentages are against the perf runs interleaved with that branch (cycles, instructions):
+| case | perf cycles / instr | targets-bitset | trigger-array | incremental-arena |
+|---|---|---|---|---|
+| gekiso_3_73 | 42.89G / 111.48G | 43.03G / 111.11G (+0.2%, -0.3%) | 42.89G / 111.51G (0%, 0%) | 41.19G / 108.44G (-3.7%, -2.7%) |
+| gekiso_5_141 | 12.19G / 26.18G | 12.29G / 26.14G (+0.2%, -0.2%) | 12.23G / 26.18G (+0.8%, 0%) | 12.08G / 26.02G (-0.9%, -0.6%) |
+| gekiso_1_5 | 26.42G / 57.44G | 26.35G / 57.29G (-0.1%, -0.3%) | 26.43G / 57.44G (+0.1%, 0%) | 26.03G / 57.09G (-1.4%, -0.6%) |
+
+wasm (frozen clock, 2 runs each, ms):
+| case | 75bf64d | targets-bitset | trigger-array | incremental-arena |
+|---|---|---|---|---|
+| challenge_points | 2200/2339 | 2214/2226 | 2259/2202 | 2273/2252 |
+| gekiso_5_141 | 10437/10344 | 10696/10476 | 10578/10682 | 10562/10404 |
+| gekiso_3_73 | 33094/33333 | 33235/32905 | 33345/33168 | 32688/32890 |
+| gekiso_1_5 | 21035/21205 | 20923/21020 | 21310/21047 | 21005/21319 |
+
+Verdicts:
+- `targets-bitset`: not worth an API change. -0.3% instructions, no cycle change native, none in wasm. The `FxHashSet` probe was not a real cost after all.
+- `trigger-array`: dead end. No change native or wasm. The stall on the `trigger` tag only moves into `Checker::check`, because the checker data itself still lives behind the same cold memory; a win would need compiling checkers into a compact form, which is a much bigger change.
+- `incremental-arena`: the only one with a real gain, -3.7% cycles on gekiso_3_73 and -1% on the others natively, about -1% (within noise) in wasm. Worth it only if changing `Incremental::notes` is acceptable to downstream users; otherwise a private-only version (factors only, `notes` unchanged) would keep perhaps a third of it (untested).
+
+Reproduce (any of the branches; replace `<hash>`):
+```
+git checkout 76dc27b            # baseline
+cargo build --release --example golden && cp target/release/examples/golden /tmp/golden-base
+git checkout <hash>             # 896ac7c | ae98895 | 7992b13
+cargo build --release --example golden && cp target/release/examples/golden /tmp/golden-eval
+for i in 1 2 3; do for b in /tmp/golden-base /tmp/golden-eval; do
+  perf stat -e cycles,instructions taskset -c 0 $b in_gekiso_3_73.json out_$(basename $b).json
+done; done
+cmp out_golden-base.json out_golden-eval.json   # identical
+# wasm
+cargo build --release --target wasm32-unknown-unknown
+HANEOKA_FROZEN_CLOCK=1 taskset -c 0 node --no-liftoff examples/wasm_golden.mjs \
+  target/wasm32-unknown-unknown/release/haneoka_team_engine.wasm in_gekiso_3_73.json out_wasm.json
+```
+(`examples/wasm_golden.mjs` exists from 76dc27b on; the eval branches include it. Use the frozen clock for wasm, see above.)
+
 ## Data structures (are hash sets the problem?)
 Short answer: no longer. After the changes above, every hash/B-tree symbol together is ~3% of single-core cycles on both 3_73 and 5_141, spread over many small sites. The cases where a different structure paid off are done:
 - luck rows: a dense `Vec<u32>` index instead of `FxHashMap` (change 2). Per DP pass only ~54 rows exist (keys spread over 2^18), so the touched index slots stay in cache; the rows themselves (~134 f64 each, two rows ~116 KB) are what exceeds L1. A small open-addressing or linear-probe table would not beat the dense index.
@@ -52,12 +126,12 @@ Short answer: no longer. After the changes above, every hash/B-tree symbol toget
 
 Remaining hash/tree sites, all small:
 - `gekiso_objective` memo keys hash whole `Vec<usize>` (`pattern_domains`, `Kernel::gain`, `Kernel::luck_base`): ~0.5% on 5_141. Interning the vectors or caching their hash would remove it.
-- `Controller::update` probes `ranges[i].targets` (`FxHashSet`) per judged note and range: ~0.5% on 3_73. A per-range bitset over note ids would be cheaper, but `Range::targets` is a pub field of a pub type, so a cached copy could go stale if a caller mutates it. Changing the field type is a public API change and needs your call.
+- `Controller::update` probes `ranges[i].targets` (`FxHashSet`) per judged note and range: ~0.5% on 3_73. A per-range bitset over note ids would be cheaper, but `Range::targets` is a pub field of a pub type, so a cached copy could go stale if a caller mutates it. Changing the field type is a public API change; evaluated below (`eval/targets-bitset`): not worth it.
 - `Incremental::fixed` (`BTreeMap`, a handful of rank bonuses) probed once per frame, plus master-data `BTreeMap`s (`note_percent`, member ranks): each <=0.6%.
 
 The larger structural cost on 3_73 is memory layout, not hashing:
-- `ConditionUpdater::prepare_triggers` (~6.4% self) stalls on the first load of each `effects[i].trigger` tag in 400-byte `Effect` records. Splitting hot checker state into a compact array (structure of arrays) would help, but `Effect` and its fields are pub.
-- Model lifecycle (`Model::new` + `clone` + drop) is ~7.7%, much of it `Incremental`'s per-frame `Vec<Vec<NoteCommand>>` / `Vec<Vec<FactorCommand>>`: every clone allocates each non-empty frame and every drop walks all frames. One arena per kind with per-frame ranges or links would make clone a few memcpys. `factors` is private (about 1% to gain); `notes` is pub.
+- `ConditionUpdater::prepare_triggers` (~6.4% self) stalls on the first load of each `effects[i].trigger` tag in 400-byte `Effect` records. Splitting hot checker state into a compact array (structure of arrays) would help, but `Effect` and its fields are pub. Evaluated below (`eval/trigger-array`): moving only the trigger out gains nothing.
+- Model lifecycle (`Model::new` + `clone` + drop) is ~7.7%, much of it `Incremental`'s per-frame `Vec<Vec<NoteCommand>>` / `Vec<Vec<FactorCommand>>`: every clone allocates each non-empty frame and every drop walks all frames. One arena per kind with per-frame ranges or links would make clone a few memcpys. `factors` is private (about 1% to gain); `notes` is pub. Evaluated below (`eval/incremental-arena`): -3.7% cycles on 3_73.
 
 ## Single-thread findings (non-parallel leads)
 - `luck` cost is dominated by per-call overhead of many short `block` calls (avg ~26 elements, ~2.5 points per row visit), not memory bandwidth.
