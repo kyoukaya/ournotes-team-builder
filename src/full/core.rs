@@ -68,6 +68,11 @@ pub fn srem(a: i32, b: i32) -> i32 {
 pub fn frame(ms: i32) -> i32 {
     if ms < 0 {
         0
+    } else if ms < 1 << 24 {
+        // Exact in binary32, and a non-multiple of 40 sits at least 1/40 from
+        // an integer, so rounding never reaches one: the float steps below
+        // equal the integer ceiling here (checked for every ms up to 2^24).
+        (ms + 39) / 40
     } else {
         ceil_i32(f(f(ms as f64) / 40.0))
     }
@@ -547,5 +552,15 @@ impl Life {
     }
     pub fn sync(&mut self, time: i32) {
         self.current = self.at(time);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn integer_frame_matches_binary32_steps() {
+        for ms in 0..1 << 24 {
+            assert_eq!(frame(ms), ceil_i32(f(f(ms as f64) / 40.0)), "{ms}");
+        }
     }
 }
