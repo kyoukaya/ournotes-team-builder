@@ -224,7 +224,7 @@ fn frame(
     for j in input {
         let n = model
             .notes
-            .get(&j.note_id)
+            .get(j.note_id)
             .ok_or_else(|| format!("unknown note {}", j.note_id))?;
         let converted = model
             .conversion

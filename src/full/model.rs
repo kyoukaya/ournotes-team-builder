@@ -382,10 +382,40 @@ pub struct GekisoLive {
     previous_lot_ms: i32,
     pub rank_bonus: Vec<RankBonus>,
 }
+/// Notes by id. Chart ids are small and dense, so they index a table
+/// directly; any other id set keeps the map.
+enum NoteIndex {
+    Dense(Vec<Option<LiveNote>>),
+    Map(HashMap<i32, LiveNote>),
+}
+impl NoteIndex {
+    fn new(notes: &[LiveNote]) -> Self {
+        let map: HashMap<i32, LiveNote> = notes.iter().map(|n| (n.id, n.clone())).collect();
+        let limit = map.len() * 2 + 64;
+        if !map.keys().all(|&id| id >= 0 && (id as usize) < limit) {
+            return Self::Map(map);
+        }
+        let len = map.keys().max().map_or(0, |&id| id as usize + 1);
+        let mut dense = vec![None; len];
+        for (id, note) in map {
+            dense[id as usize] = Some(note);
+        }
+        Self::Dense(dense)
+    }
+    fn get(&self, id: i32) -> Option<&LiveNote> {
+        match self {
+            Self::Dense(dense) => usize::try_from(id)
+                .ok()
+                .and_then(|i| dense.get(i))
+                .and_then(Option::as_ref),
+            Self::Map(map) => map.get(&id),
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Model<'a> {
     pub master: &'a Master,
-    notes: Rc<HashMap<i32, LiveNote>>,
+    notes: Rc<NoteIndex>,
     events: Vec<(usize, i32)>,
     by_time: Vec<usize>,
     pub random: Random,
@@ -536,7 +566,7 @@ impl<'a> Model<'a> {
         let life_length = notes.iter().map(|n| n.time_ms).max().unwrap_or(0).max(0) + 1000;
         let mut model = Self {
             master,
-            notes: Rc::new(notes.iter().map(|n| (n.id, n.clone())).collect()),
+            notes: Rc::new(NoteIndex::new(notes)),
             events: events.to_vec(),
             by_time,
             random: Random::new(seed),
@@ -926,21 +956,24 @@ impl<'a> Model<'a> {
             }
         }
         self.frame_events.clear();
-        let mut due = Vec::new();
+        let first = self.fired;
         while self.fired < self.events.len() && self.events[self.by_time[self.fired]].1 <= time {
-            due.push(self.by_time[self.fired]);
             self.fired += 1;
         }
-        due.sort_unstable();
-        self.frame_events
-            .extend(due.into_iter().map(|i| self.events[i]));
+        // Most frames fire nothing; due events go out in event order.
+        if self.fired > first {
+            let mut due = self.by_time[first..self.fired].to_vec();
+            due.sort_unstable();
+            self.frame_events
+                .extend(due.into_iter().map(|i| self.events[i]));
+        }
         self.judged.clear();
         self.results.clear();
         let mut broken = false;
         for j in judged {
             let n = self
                 .notes
-                .get(&j.note_id)
+                .get(j.note_id)
                 .ok_or_else(|| format!("unknown note {}", j.note_id))?;
             let converted = self
                 .conversion
