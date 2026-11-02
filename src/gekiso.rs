@@ -27,11 +27,14 @@ pub struct MissRule {
     pub value: i32,
     pub chance: f64,
 }
-#[derive(Clone)]
 pub struct Recorded {
     pub input: luck::Input,
     pub curve: luck::Output,
+    /// Range remainders settled against this record, by range and residue signature.
+    remainders: std::sync::Mutex<HashMap<(usize, Box<[i8]>), f64>>,
 }
+/// Remainders kept per record; a full cache only stops growing.
+const REMAINDER_ENTRIES: usize = 256;
 pub struct Chart {
     pub music_type: i32,
     pub full: play::Chart,
@@ -1219,7 +1222,11 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
             + curve.curve.len() * 96
             + curve.residues.capacity() * 8
             + std::mem::size_of::<Recorded>();
-        let record = Arc::new(Recorded { input, curve });
+        let record = Arc::new(Recorded {
+            input,
+            curve,
+            remainders: Default::default(),
+        });
         const CACHE_BYTES: usize = 32 * 1024 * 1024;
         if bytes <= CACHE_BYTES {
             if chart.curve_bytes + bytes > CACHE_BYTES {
@@ -1383,7 +1390,7 @@ fn rank_remainder(
     input: &mut luck::Input,
     range: usize,
     outcomes: &[f64],
-    cache: &mut HashMap<Vec<i32>, f64>,
+    cache: &std::sync::Mutex<HashMap<(usize, Box<[i8]>), f64>>,
     prepared: &RemainderRange,
 ) -> Result<f64, String> {
     let percent = chart.range_percent[range];
@@ -1392,17 +1399,18 @@ fn rank_remainder(
         return Ok(0.0);
     }
     let mut initial = 0;
-    let mut signature = Vec::with_capacity(1 + 4 * prepared.members.len());
-    signature.push(range as i32);
+    // `modulus` divides 100, so every residue fits an i8.
+    let mut signature = Vec::with_capacity(4 * prepared.members.len());
     for &(i, observed) in &prepared.members {
         if !observed {
             initial = (initial + outcomes[4 * i] as usize) % modulus;
         }
         for mask in 0..4 {
-            signature.push((outcomes[4 * i + mask] as i32) % (modulus as i32));
+            signature.push(((outcomes[4 * i + mask] as i32) % (modulus as i32)) as i8);
         }
     }
-    if let Some(&value) = cache.get(&signature) {
+    let key = (range, signature.into_boxed_slice());
+    if let Some(&value) = cache.lock().unwrap().get(&key) {
         return Ok(value);
     }
     input.ranges.clear();
@@ -1424,7 +1432,10 @@ fn rank_remainder(
     for (residue, &probability) in result.residues.iter().enumerate() {
         value += probability * ((residue as i32 * percent) % 100) as f64 / 100.0;
     }
-    cache.insert(signature, value);
+    let mut cache = cache.lock().unwrap();
+    if cache.len() < REMAINDER_ENTRIES {
+        cache.insert(key, value);
+    }
     Ok(value)
 }
 struct Active {
@@ -1765,7 +1776,6 @@ fn score_orders_selected(
         .map(|(&g, &c)| f(g * c))
         .collect();
     let mut outcomes = vec![0.0; n * 4];
-    let mut remainders = HashMap::default();
     let ranges = chart.range_percent.len();
     let mut remainder_ranges: Vec<Option<RemainderRange>> = (0..ranges).map(|_| None).collect();
     let mut scores = vec![0.0; 120];
@@ -1987,7 +1997,7 @@ fn score_orders_selected(
                         settlement,
                         range,
                         &outcomes,
-                        &mut remainders,
+                        &ctx.nominal.as_ref().unwrap().recorded.remainders,
                         remainder_ranges[range].as_ref().unwrap(),
                     )?
                 } else {
