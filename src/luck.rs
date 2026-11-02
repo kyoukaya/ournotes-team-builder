@@ -4,6 +4,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 const HIGH: u64 = (1 << 18) - 1;
+/// Residue counts up to this get a direct-mapped row index.
+const MAX_DENSE_RESIDUES: usize = 4;
 const MISS_USED: u64 = 1 << 19;
 const PREV_MISS: u64 = 1 << 20;
 const FRAME_LOT: u64 = 1 << 21;
@@ -122,12 +124,18 @@ impl Rows {
             dense: None,
         }
     }
-    fn dense() -> Self {
+    /// A direct-mapped index over every key below `(HIGH + 1) * residues`.
+    fn dense(residues: usize) -> Self {
         let mut rows = Self::new();
+        let size = (HIGH as usize + 1) * residues;
         rows.dense = Some(INDEX_POOL.with(|pool| {
-            pool.borrow_mut()
+            let (mut index, touched) = pool
+                .borrow_mut()
                 .pop()
-                .unwrap_or_else(|| (vec![0; HIGH as usize + 1], Vec::new()))
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            // Pooled indexes are all zero: `clear_index` resets what was touched.
+            index.resize(size, 0);
+            (index, touched)
         }));
         rows
     }
@@ -241,7 +249,7 @@ impl<'a> Engine<'a> {
         let unit = gauge_unit(input);
         let maxima = [input.maximum / unit, input.rush_maximum / unit];
         let width = maxima[0].max(maxima[1]);
-        let dense = input.modulus == 0 && input.initial == 0;
+        let dense = input.modulus <= MAX_DENSE_RESIDUES && input.initial < input.modulus.max(1);
         let pool = POOL.with(|p| {
             let mut p = p.borrow_mut();
             if p.0 == width {
@@ -264,8 +272,8 @@ impl<'a> Engine<'a> {
             unit,
             maxima,
             width,
-            rows: if dense { Rows::dense() } else { Rows::new() },
-            spare: if dense { Rows::dense() } else { Rows::new() },
+            rows: if dense { Rows::dense(input.modulus.max(1)) } else { Rows::new() },
+            spare: if dense { Rows::dense(input.modulus.max(1)) } else { Rows::new() },
             pool,
             draws: HashMap::default(),
             transitions: LotTransitions::default(),
