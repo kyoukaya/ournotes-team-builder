@@ -301,6 +301,8 @@ impl IdleInputs {
 #[derive(Clone)]
 pub struct ConditionUpdater {
     pub effects: Vec<Effect>,
+    /// Trigger checkers, moved out of `effects` so the per-frame scan stays dense.
+    triggers: Vec<Option<Checker>>,
     pub gate: Option<i32>,
     pub updaters: Vec<Updater>,
     sorted: Vec<usize>,
@@ -318,9 +320,11 @@ pub struct ConditionUpdater {
 }
 impl ConditionUpdater {
     pub(crate) fn fixed_life(&mut self, life: i32) {
+        for checker in self.triggers.iter_mut().flatten() {
+            checker.fixed_life(life);
+        }
         for effect in &mut self.effects {
             for checker in [
-                &mut effect.trigger,
                 &mut effect.condition,
                 &mut effect.release,
                 &mut effect.reset,
@@ -337,7 +341,7 @@ impl ConditionUpdater {
             }
         }
     }
-    pub fn new(effects: Vec<Effect>, gate: Option<i32>) -> Result<Self, String> {
+    pub fn new(mut effects: Vec<Effect>, gate: Option<i32>) -> Result<Self, String> {
         let mut ids: Vec<_> = effects.iter().map(|e| e.id).collect();
         ids.sort_unstable();
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -407,8 +411,10 @@ impl ConditionUpdater {
         let count = effects.len();
         let second_phase = effects.iter().any(|effect| effect.phase == 2);
         let first_phase = effects.iter().any(|effect| effect.phase == 1);
+        let triggers = effects.iter_mut().map(|e| e.trigger.take()).collect();
         Ok(Self {
             effects,
+            triggers,
             gate,
             updaters,
             sorted,
@@ -498,7 +504,7 @@ impl ConditionUpdater {
             .is_some_and(|inputs| !inputs.active(ctx))
         {
             for &index in &self.sorted {
-                self.effects[index].trigger.as_mut().unwrap().override_time = None;
+                self.triggers[index].as_mut().unwrap().override_time = None;
             }
             return Ok(false);
         }
@@ -509,7 +515,7 @@ impl ConditionUpdater {
             }
         }
         for &e in &self.sorted {
-            self.cache[e] = Some(if let Some(checker) = &mut self.effects[e].trigger {
+            self.cache[e] = Some(if let Some(checker) = &mut self.triggers[e] {
                 let hit = checker.check(ctx)?.0;
                 Trigger {
                     hit,
