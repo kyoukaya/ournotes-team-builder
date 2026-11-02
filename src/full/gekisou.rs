@@ -362,7 +362,43 @@ pub struct Range {
     pub start: i32,
     pub end: i32,
     pub mission: i32,
-    pub targets: HashSet<i32>,
+    pub targets: NoteSet,
+}
+/// Note ids as a bitset over `[base, base + 64 * bits.len())`.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NoteSet {
+    base: i32,
+    bits: Vec<u64>,
+}
+impl NoteSet {
+    #[inline]
+    pub fn contains(&self, id: &i32) -> bool {
+        let offset = id.wrapping_sub(self.base) as u32 as usize;
+        self.bits
+            .get(offset >> 6)
+            .is_some_and(|word| word >> (offset & 63) & 1 != 0)
+    }
+    pub fn len(&self) -> usize {
+        self.bits.iter().map(|word| word.count_ones() as usize).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&word| word == 0)
+    }
+}
+impl FromIterator<i32> for NoteSet {
+    fn from_iter<I: IntoIterator<Item = i32>>(iter: I) -> Self {
+        let ids: Vec<i32> = iter.into_iter().collect();
+        let (Some(&low), Some(&high)) = (ids.iter().min(), ids.iter().max()) else {
+            return Self::default();
+        };
+        let span = (high as i64 - low as i64) as usize + 1;
+        let mut bits = vec![0u64; span.div_ceil(64)];
+        for id in ids {
+            let offset = (id as i64 - low as i64) as usize;
+            bits[offset >> 6] |= 1 << (offset & 63);
+        }
+        Self { base: low, bits }
+    }
 }
 #[derive(Clone)]
 pub struct State {
