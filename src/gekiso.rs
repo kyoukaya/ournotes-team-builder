@@ -17,7 +17,6 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use std::{
     borrow::Cow,
-    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
@@ -1308,14 +1307,20 @@ pub fn settle_slack(chart: &Chart) -> usize {
         .filter(|(i, _)| chart.setup.missions[*i] == 2)
         .count()
 }
-fn rank_remainder(
+/// What `rank_remainder` needs about one range, fixed for the frames of one settlement.
+struct RemainderRange {
+    modulus: usize,
+    /// Chart index of each note in the range, with whether the range's frames judge it.
+    members: Vec<(usize, bool)>,
+    /// Chart index of each judged note across all frames, when it belongs to the range.
+    judged: Vec<Option<usize>>,
+}
+fn remainder_range(
     chart: &Chart,
-    input: &mut luck::Input,
+    input: &luck::Input,
     range: usize,
-    outcomes: &[f64],
-    cache: &mut HashMap<Vec<i32>, f64>,
     index: &HashMap<i32, usize>,
-) -> Result<f64, String> {
+) -> Result<RemainderRange, String> {
     let percent = chart.range_percent[range];
     let (mut divisor, mut numerator) = (100, percent);
     while numerator != 0 {
@@ -1325,7 +1330,11 @@ fn rank_remainder(
     }
     let modulus = (100 / divisor) as usize;
     if modulus == 1 {
-        return Ok(0.0);
+        return Ok(RemainderRange {
+            modulus,
+            members: Vec::new(),
+            judged: Vec::new(),
+        });
     }
     let first = input
         .frames
@@ -1340,17 +1349,53 @@ fn rank_remainder(
         .find(|(_, frame)| frame.states[range] == 8)
         .map(|(i, _)| i)
         .unwrap_or(input.frames.len() - 1);
-    let observed: HashSet<_> = input.frames[first..=last]
-        .iter()
-        .flat_map(|frame| frame.judged.iter().map(|note| note.id))
-        .collect();
-    let mut initial = 0;
-    let mut signature = vec![range as i32];
-    for (i, note) in chart.notes.iter().enumerate() {
-        if chart.range_of[i] != range as i32 {
-            continue;
+    let mut observed = vec![false; chart.notes.len()];
+    for frame in &input.frames[first..=last] {
+        for note in &frame.judged {
+            if let Some(&i) = index.get(&note.id) {
+                observed[i] = true;
+            }
         }
-        if !observed.contains(&note.id) {
+    }
+    let members = (0..chart.notes.len())
+        .filter(|&i| chart.range_of[i] == range as i32)
+        .map(|i| (i, observed[i]))
+        .collect();
+    let judged = input
+        .frames
+        .iter()
+        .flat_map(|frame| &frame.judged)
+        .map(|note| {
+            index
+                .get(&note.id)
+                .copied()
+                .filter(|&i| chart.range_of[i] == range as i32)
+        })
+        .collect();
+    Ok(RemainderRange {
+        modulus,
+        members,
+        judged,
+    })
+}
+fn rank_remainder(
+    chart: &Chart,
+    input: &mut luck::Input,
+    range: usize,
+    outcomes: &[f64],
+    cache: &mut HashMap<Vec<i32>, f64>,
+    prepared: &RemainderRange,
+) -> Result<f64, String> {
+    let percent = chart.range_percent[range];
+    let modulus = prepared.modulus;
+    if modulus == 1 {
+        return Ok(0.0);
+    }
+    let mut initial = 0;
+    let mut signature = Vec::with_capacity(1 + 4 * prepared.members.len());
+    signature.push(range as i32);
+    for &(i, observed) in &prepared.members {
+        if !observed {
             initial = (initial + outcomes[4 * i] as usize) % modulus;
         }
         for mask in 0..4 {
@@ -1364,17 +1409,15 @@ fn rank_remainder(
     input.ranges.push(range);
     input.modulus = modulus;
     input.initial = initial;
-    for frame in Arc::make_mut(&mut input.frames) {
-        for note in &mut frame.judged {
-            note.scores = if let Some(&i) = index
-                .get(&note.id)
-                .filter(|&&i| chart.range_of[i] == range as i32)
-            {
-                std::array::from_fn(|mask| outcomes[4 * i + mask] as i32)
-            } else {
-                [0; 4]
-            };
-        }
+    let notes = Arc::make_mut(&mut input.frames)
+        .iter_mut()
+        .flat_map(|frame| &mut frame.judged);
+    for (note, &chart_index) in notes.zip(&prepared.judged) {
+        note.scores = if let Some(i) = chart_index {
+            std::array::from_fn(|mask| outcomes[4 * i + mask] as i32)
+        } else {
+            [0; 4]
+        };
     }
     let result = luck::run(input)?;
     let mut value = 0.0;
@@ -1724,6 +1767,7 @@ fn score_orders_selected(
     let mut outcomes = vec![0.0; n * 4];
     let mut remainders = HashMap::default();
     let ranges = chart.range_percent.len();
+    let mut remainder_ranges: Vec<Option<RemainderRange>> = (0..ranges).map(|_| None).collect();
     let mut scores = vec![0.0; 120];
     let mut range_score = vec![0.0; ranges];
     let plan = live::plan(slots);
@@ -1933,13 +1977,18 @@ fn score_orders_selected(
         for (range, &value) in range_score.iter().enumerate() {
             if ctx.nominal.is_some() && chart.setup.missions[range] == 2 {
                 let remainder = if settle {
+                    let settlement = settlement.as_mut().unwrap();
+                    if remainder_ranges[range].is_none() {
+                        remainder_ranges[range] =
+                            Some(remainder_range(chart, settlement, range, &note_index)?);
+                    }
                     rank_remainder(
                         chart,
-                        settlement.as_mut().unwrap(),
+                        settlement,
                         range,
                         &outcomes,
                         &mut remainders,
-                        &note_index,
+                        remainder_ranges[range].as_ref().unwrap(),
                     )?
                 } else {
                     0.0
