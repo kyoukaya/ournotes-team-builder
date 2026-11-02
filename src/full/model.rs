@@ -390,15 +390,15 @@ enum NoteIndex {
 }
 impl NoteIndex {
     fn new(notes: &[LiveNote]) -> Self {
-        let map: HashMap<i32, LiveNote> = notes.iter().map(|n| (n.id, n.clone())).collect();
-        let limit = map.len() * 2 + 64;
-        if !map.keys().all(|&id| id >= 0 && (id as usize) < limit) {
-            return Self::Map(map);
+        let limit = notes.len() * 2 + 64;
+        if !notes.iter().all(|n| n.id >= 0 && (n.id as usize) < limit) {
+            return Self::Map(notes.iter().map(|n| (n.id, n.clone())).collect());
         }
-        let len = map.keys().max().map_or(0, |&id| id as usize + 1);
+        let len = notes.iter().map(|n| n.id as usize + 1).max().unwrap_or(0);
         let mut dense = vec![None; len];
-        for (id, note) in map {
-            dense[id as usize] = Some(note);
+        // A repeated id keeps its last note, as the map's inserts did.
+        for note in notes {
+            dense[note.id as usize] = Some(note.clone());
         }
         Self::Dense(dense)
     }
