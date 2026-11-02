@@ -261,12 +261,63 @@ pub(crate) enum ReplayCommand {
     Calculate(i32),
     Rush(i32, i32),
 }
+const NONE: u32 = u32::MAX;
+/// Commands filed by frame in one pool: each frame is a linked list in insertion
+/// order, so cloning is a few flat copies instead of one allocation per frame.
+#[derive(Clone)]
+pub struct FrameLists<T> {
+    items: Vec<T>,
+    next: Vec<u32>,
+    head: Vec<u32>,
+    tail: Vec<u32>,
+}
+impl<T> FrameLists<T> {
+    fn new(frames: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            next: Vec::new(),
+            head: vec![NONE; frames],
+            tail: vec![NONE; frames],
+        }
+    }
+    fn push(&mut self, frame: usize, item: T) {
+        let index = self.items.len() as u32;
+        self.items.push(item);
+        self.next.push(NONE);
+        match self.tail[frame] {
+            NONE => self.head[frame] = index,
+            last => self.next[last as usize] = index,
+        }
+        self.tail[frame] = index;
+    }
+    /// Pool indices of one frame, in insertion order.
+    pub fn indices(&self, frame: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut at = self.head[frame];
+        std::iter::from_fn(move || {
+            (at != NONE).then(|| {
+                let index = at as usize;
+                at = self.next[index];
+                index
+            })
+        })
+    }
+    pub fn frame(&self, frame: usize) -> impl Iterator<Item = &T> + '_ {
+        self.indices(frame).map(|index| &self.items[index])
+    }
+    pub fn is_empty_frame(&self, frame: usize) -> bool {
+        self.head[frame] == NONE
+    }
+    /// Every command, frame by frame, in insertion order within a frame.
+    pub fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        (0..self.head.len()).flat_map(|frame| self.frame(frame))
+    }
+}
 #[derive(Clone)]
 pub struct Incremental<'a> {
     pub calculator: Calculator<'a>,
     pub max_frame: usize,
-    pub notes: Vec<Vec<NoteCommand>>,
-    factors: Vec<Vec<FactorCommand>>,
+    pub notes: FrameLists<NoteCommand>,
+    factors: FrameLists<FactorCommand>,
     factor_order: Vec<usize>,
     pub(crate) replay: Option<Vec<ReplayCommand>>,
     note_order: Vec<usize>,
@@ -284,8 +335,8 @@ impl<'a> Incremental<'a> {
         Self {
             calculator,
             max_frame,
-            notes: vec![Vec::new(); max_frame],
-            factors: vec![Vec::new(); max_frame],
+            notes: FrameLists::new(max_frame),
+            factors: FrameLists::new(max_frame),
             factor_order: Vec::new(),
             replay: None,
             note_order: Vec::new(),
@@ -301,7 +352,6 @@ impl<'a> Incremental<'a> {
     pub(crate) fn note_factor_commands(&self) -> Vec<(i32, i32)> {
         self.factors
             .iter()
-            .flatten()
             .filter(|c| c.note != 0)
             .map(|c| (c.time, c.note))
             .collect()
@@ -311,7 +361,6 @@ impl<'a> Incremental<'a> {
     ) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
         self.factors
             .iter()
-            .flatten()
             .filter(|c| c.note != 0)
             .map(|c| (c.owner, c.time, c.note))
     }
@@ -319,7 +368,6 @@ impl<'a> Incremental<'a> {
         let mut commands: Vec<_> = self
             .factors
             .iter()
-            .flatten()
             .filter(|command| command.luck != 0)
             .map(|command| (command.time, command.luck))
             .collect();
@@ -329,7 +377,6 @@ impl<'a> Incremental<'a> {
     pub(crate) fn rush_factor_changes(&self) -> usize {
         self.factors
             .iter()
-            .flatten()
             .filter(|command| command.luck != 0)
             .count()
     }
@@ -355,14 +402,14 @@ impl<'a> Incremental<'a> {
         if let Some(replay) = &mut self.replay {
             replay.push(ReplayCommand::Note(note.clone()));
         }
-        self.notes[frame].push(note);
+        self.notes.push(frame, note);
     }
     pub fn add_factor(&mut self, command: FactorCommand) {
         if let Some(replay) = &mut self.replay {
             replay.push(ReplayCommand::Factor(command.clone()));
         }
         let frame = self.file(command.time);
-        self.factors[frame].push(command);
+        self.factors.push(frame, command);
     }
     pub fn add_fixed(&mut self, time: i32, score: i32) {
         self.pending_fixed = Some((time, score));
@@ -406,7 +453,7 @@ impl<'a> Incremental<'a> {
         Ok(self.score)
     }
     fn undo(&mut self, frame: usize) {
-        for note in &self.notes[frame] {
+        for note in self.notes.frame(frame) {
             self.score = self.score.wrapping_sub(note.added);
         }
         if let Some(&value) = self.fixed.get(&(frame as i32)) {
@@ -420,45 +467,36 @@ impl<'a> Incremental<'a> {
         combo: &Combo,
         info: Option<&dyn GekisoCombo>,
     ) -> Result<(), String> {
-        let (fl, nl) = (&self.factors[frame], &self.notes[frame]);
-        if fl.is_empty() && nl.is_empty() {
+        if self.factors.is_empty_frame(frame) && self.notes.is_empty_frame(frame) {
             if let Some(&value) = self.fixed.get(&(frame as i32)) {
                 self.score = self.score.wrapping_add(value);
                 self.rank_bonus = self.rank_bonus.wrapping_add(value);
             }
             return Ok(());
         }
-        let mut factor_stack = [0usize, 1, 2, 3, 4, 5, 6, 7];
-        let factor_order = if fl.len() <= factor_stack.len() {
-            &mut factor_stack[..fl.len()]
-        } else {
-            self.factor_order.clear();
-            self.factor_order.extend(0..fl.len());
-            self.factor_order.as_mut_slice()
-        };
-        factor_order.sort_unstable_by_key(|&i| (fl[i].time, fl[i].owner, i));
-        let mut note_stack = [0usize, 1, 2, 3, 4, 5, 6, 7];
-        let note_order = if nl.len() <= note_stack.len() {
-            &mut note_stack[..nl.len()]
-        } else {
-            self.note_order.clear();
-            self.note_order.extend(0..nl.len());
-            self.note_order.as_mut_slice()
-        };
-        note_order.sort_unstable_by_key(|&i| (nl[i].time, nl[i].id, i));
+        // Pool indices grow with insertion, so they order ties like positions in the frame did.
+        self.factor_order.clear();
+        self.factor_order.extend(self.factors.indices(frame));
+        let fl = &self.factors.items;
+        self.factor_order
+            .sort_unstable_by_key(|&i| (fl[i].time, fl[i].owner, i));
+        self.note_order.clear();
+        self.note_order.extend(self.notes.indices(frame));
+        let nl = &self.notes.items;
+        self.note_order.sort_unstable_by_key(|&i| (nl[i].time, nl[i].id, i));
         let (mut a, mut b) = (0, 0);
-        while a < factor_order.len() || b < note_order.len() {
-            if a < factor_order.len()
-                && (b >= note_order.len()
-                    || self.notes[frame][note_order[b]].time
-                        >= self.factors[frame][factor_order[a]].time)
+        while a < self.factor_order.len() || b < self.note_order.len() {
+            if a < self.factor_order.len()
+                && (b >= self.note_order.len()
+                    || self.notes.items[self.note_order[b]].time
+                        >= self.factors.items[self.factor_order[a]].time)
             {
-                let c = &self.factors[frame][factor_order[a]];
+                let c = &self.factors.items[self.factor_order[a]];
                 self.calculator.factors.apply(c);
                 self.diffs[frame].add(c);
                 a += 1;
             } else {
-                let n = &mut self.notes[frame][note_order[b]];
+                let n = &mut self.notes.items[self.note_order[b]];
                 let value = self.calculator.note_score(combo.at(n.time), n, info)?;
                 n.added = value;
                 self.score = self.score.wrapping_add(value);
